@@ -61,10 +61,16 @@ def latest_rf():
 
 
 # ---- maths ---------------------------------------------------------------
-def estimate(r, lw, shrink):
-    """Annual mean/cov. Returns are shrunk toward their cross-asset mean; cov optionally Ledoit-Wolf."""
+def estimate(r, lw, shrink, mu_tilt=None):
+    """Annual mean/cov. Returns are shrunk toward their cross-asset mean; cov optionally Ledoit-Wolf.
+
+    mu_tilt: optional per-asset annual return adjustment (array aligned to r's columns). This is the single
+    extension point for outside views such as market sentiment (see README roadmap).
+    """
     mu = r.mean().values * DAYS
     mu = (1 - shrink) * mu + shrink * mu.mean()
+    if mu_tilt is not None:
+        mu = mu + mu_tilt
     cov = (LedoitWolf().fit(r.values).covariance_ if lw else r.cov().values) * DAYS
     return mu, cov
 
@@ -167,6 +173,8 @@ with st.sidebar:
     shrink = st.slider("Shrink expected returns toward the average", 0.0, 1.0, 0.0, 0.1,
                        help="Optional. Tames extreme bets from noisy historical means, but in testing it lowered "
                             "out-of-sample Sharpe on a stocks+bonds+gold universe, so it is off by default.")
+    st.checkbox("Market-sentiment tilt (planned)", False, disabled=True,
+                help="Roadmap: sentiment-driven return views feeding the optimizer. See README.")
 
 tickers = list(ss.universe)
 if len(tickers) < 2:
@@ -209,24 +217,31 @@ if (lo > hi).any() or lo.sum() > 1 or hi.sum() < 1:
     st.error("Limits are infeasible: each min must be <= max, mins must total <= 100% and maxes >= 100%.")
     st.stop()
 
-# the user's own portfolio
+# money to invest / already invested
 with tab_me:
-    st.write("Enter your own allocation (or a what-if). Weights are normalised to 100%.")
-    value = st.number_input("Portfolio value ($)", 0, 10 ** 9, 10000, 1000)
-    mine = st.data_editor(
-        pd.DataFrame({"Asset": names, "Class": classes, "Weight %": round(100 / n, 2)}), hide_index=True,
-        key="me" + key, column_config={"Asset": st.column_config.TextColumn(disabled=True),
-                                      "Class": st.column_config.TextColumn(disabled=True),
-                                      "Weight %": st.column_config.NumberColumn(min_value=0.0, max_value=100.0)})
-    w_me = mine["Weight %"].values / max(mine["Weight %"].sum(), 1e-12)
-    if mine["Weight %"].sum() <= 0:
-        w_me = np.full(n, 1 / n)
+    mode = st.radio("What do you want to do?", ["Invest new money", "I already hold these assets"], horizontal=True)
+    if mode == "Invest new money":
+        held = np.zeros(n)
+        cash = st.number_input("Amount to invest ($)", 0, 10 ** 9, 10000, 500)
+    else:
+        h = st.data_editor(
+            pd.DataFrame({"Asset": names, "Class": classes, "Invested $": 0.0}), hide_index=True, key="held" + key,
+            column_config={"Asset": st.column_config.TextColumn(disabled=True),
+                           "Class": st.column_config.TextColumn(disabled=True),
+                           "Invested $": st.column_config.NumberColumn(min_value=0.0, format="%.2f")})
+        held = h["Invested $"].values.astype(float)
+        cash = st.number_input("Extra cash to add ($, optional)", 0, 10 ** 9, 0, 500)
+    total = held.sum() + cash
+    w_me = held / held.sum() if held.sum() > 0 else None
+    whole = st.checkbox("Whole shares only", False, help="Otherwise fractional shares/units are assumed.")
 
 w_sh, w_mv = optimise(mu, cov, rf, lo, hi, "sharpe"), optimise(mu, cov, rf, lo, hi, "vol")
 if w_sh is None or w_mv is None:
     st.error("Optimizer failed - try loosening the limits.")
     st.stop()
-portfolios = {"Max Sharpe": w_sh, "Min Volatility": w_mv, "Equal Weight": np.full(n, 1 / n), "My Portfolio": w_me}
+portfolios = {"Max Sharpe": w_sh, "Min Volatility": w_mv, "Equal Weight": np.full(n, 1 / n)}
+if w_me is not None:
+    portfolios["My Portfolio"] = w_me
 
 # ---- Optimize tab --------------------------------------------------------
 with tab_opt:
@@ -265,16 +280,33 @@ with tab_opt:
 
 # ---- My portfolio tab ----------------------------------------------------
 with tab_me:
-    target_name = st.selectbox("Compare / rebalance toward", ["Max Sharpe", "Min Volatility", "Equal Weight"])
+    target_name = st.selectbox("Recommended allocation to follow", ["Max Sharpe", "Min Volatility", "Equal Weight"])
     tgt = portfolios[target_name]
-    rb = pd.DataFrame({"Class": classes, "Current %": w_me * 100, f"{target_name} %": tgt * 100,
-                       "Trade $": (tgt - w_me) * value}, index=names)
-    st.dataframe(rb.style.format({"Current %": "{:.1f}", f"{target_name} %": "{:.1f}", "Trade $": "{:+,.0f}"}))
-    a, b = stats(w_me, mu, cov, rf), stats(tgt, mu, cov, rf)
-    st.write(f"**Yours:** return {a[0]:.2%}, vol {a[1]:.2%}, Sharpe {a[2]:.2f}  |  "
-             f"**{target_name}:** return {b[0]:.2%}, vol {b[1]:.2%}, Sharpe {b[2]:.2f}")
-    byclass = pd.DataFrame({"Yours": w_me, target_name: tgt}, index=names).groupby(classes).sum()
-    st.dataframe(byclass.style.format("{:.1%}"))
+    if total <= 0:
+        st.info("Enter an amount to invest or the amounts you already hold.")
+    else:
+        px = np.array([prices[t].dropna().iloc[-1] for t in names])
+        trade = tgt * total - held
+        shares = np.trunc(trade / px) if whole else trade / px  # truncate toward zero: never oversell
+        after = held + shares * px
+        plan = pd.DataFrame({"Class": classes, "Current $": held, "Current %": held / total * 100,
+                             "Target %": tgt * 100, "Target $": tgt * total, "Trade $": shares * px,
+                             "Price": px, "Shares": shares}, index=names)
+        st.dataframe(plan.style.format({"Current $": "{:,.0f}", "Current %": "{:.1f}", "Target %": "{:.1f}",
+                                        "Target $": "{:,.0f}", "Trade $": "{:+,.0f}", "Price": "{:,.2f}",
+                                        "Shares": "{:+,.0f}" if whole else "{:+,.4f}"}))
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total after plan", f"${after.sum():,.0f}")
+        c2.metric("Uninvested cash", f"${total - after.sum():,.2f}")
+        c3.metric("Prices as of", str(prices.index[-1].date()))
+        st.download_button("Download plan (CSV)", plan.to_csv().encode(), "investment_plan.csv")
+        if w_me is not None:
+            a, b = stats(w_me, mu, cov, rf), stats(tgt, mu, cov, rf)
+            st.write(f"**Your holdings:** return {a[0]:.2%}, vol {a[1]:.2%}, Sharpe {a[2]:.2f}  |  "
+                     f"**{target_name}:** return {b[0]:.2%}, vol {b[1]:.2%}, Sharpe {b[2]:.2f}")
+        byclass = pd.DataFrame({"Current": held / total, target_name: tgt}, index=names).groupby(classes).sum()
+        st.dataframe(byclass.style.format("{:.1%}"))
+        st.caption("Trades may include sells when you already hold assets. Ignores taxes, fees and minimum order sizes.")
 
 # ---- Backtest tab --------------------------------------------------------
 with tab_bt:
