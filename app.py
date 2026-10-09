@@ -201,7 +201,7 @@ mu, cov = estimate(rets, lw, shrink)
 st.caption(f"{n} assets | {rets.index[0].date()} to {rets.index[-1].date()} "
            f"({len(rets)} trading days, limited by the shortest-history asset)")
 
-tab_opt, tab_me, tab_bt, tab_risk = st.tabs(["Optimize", "My portfolio", "Backtest", "Risk & simulation"])
+tab_opt, tab_me, tab_bt, tab_fc, tab_risk = st.tabs(["Optimize", "My portfolio", "Backtest", "Forecast", "Risk & simulation"])
 key = "|".join(names)
 
 # per-asset limits
@@ -325,6 +325,63 @@ with tab_bt:
             {"CAGR": "{:.2%}", "Volatility": "{:.2%}", "Sharpe": "{:.3f}", "Max drawdown": "{:.2%}"}))
         st.caption(f"Weights re-estimated each period from the prior {bt_years} years only; "
                    f"out-of-sample from {bt.index[0].date()}. Uses the estimation settings from the sidebar.")
+
+# ---- Forecast tab --------------------------------------------------------
+Z = {5: -1.645, 25: -0.674, 50: 0.0, 75: 0.674, 95: 1.645}
+
+
+def band(m, sd, v0, t):
+    """Normal-return (geometric Brownian motion) percentiles of portfolio value after t years."""
+    centre = np.log(v0) + (m - 0.5 * sd ** 2) * t
+    return {p: np.exp(centre + z * sd * np.sqrt(t)) for p, z in Z.items()}
+
+
+def fan_chart(x, b):
+    fig = go.Figure()
+    for lo_p, hi_p, name in [(5, 95, "5-95%"), (25, 75, "25-75%")]:
+        fig.add_scatter(x=x, y=b[hi_p], line_width=0, showlegend=False)
+        fig.add_scatter(x=x, y=b[lo_p], fill="tonexty", line_width=0, name=name)
+    fig.add_scatter(x=x, y=b[50], name="Median")
+    return fig
+
+
+with tab_fc:
+    st.write("Standard statistical forecast: portfolio value if returns are normally distributed with the "
+             "expected return and volatility from the sidebar settings (geometric Brownian motion).")
+    f1, f2, f3 = st.columns(3)
+    fc_pf = f1.selectbox("Portfolio", list(portfolios), key="fc_pf")
+    fc_yrs = f2.slider("Horizon (years)", 1, 10, 3, key="fc_h")
+    fc_v0 = f3.number_input("Starting value ($)", 1000, 10 ** 9, 10000, 1000, key="fc_v")
+    m_, sd_, _ = stats(portfolios[fc_pf], mu, cov, rf)
+    t = np.arange(1, fc_yrs * DAYS + 1) / DAYS
+    bd = band(m_, sd_, fc_v0, t)
+    fig_fc = fan_chart(t, bd)
+    fig_fc.update_layout(xaxis_title="Years", yaxis_title="Portfolio value ($)", height=450)
+    st.plotly_chart(fig_fc, use_container_width=True)
+    yrs = list(range(1, fc_yrs + 1))
+    st.dataframe(pd.DataFrame({
+        "Expected value": [fc_v0 * np.exp(m_ * y) for y in yrs],
+        "Median": [bd[50][y * DAYS - 1] for y in yrs],
+        "Low (5%)": [bd[5][y * DAYS - 1] for y in yrs],
+        "High (95%)": [bd[95][y * DAYS - 1] for y in yrs]}, index=[f"Year {y}" for y in yrs]
+    ).style.format("${:,.0f}"))
+    st.caption(f"Assumes {m_:.1%} expected return and {sd_:.1%} volatility per year, constant. Real returns have "
+               "fatter tails and changing volatility, so extreme outcomes are understated. Not a prediction.")
+
+    st.subheader("Reality check: the same method on the last year")
+    pr_f = rets.values @ portfolios[fc_pf]
+    m_h, sd_h = pr_f[:-DAYS].mean() * DAYS, pr_f[:-DAYS].std() * np.sqrt(DAYS)  # fitted on data before the last year
+    actual = np.cumprod(1 + pr_f[-DAYS:])
+    th = np.arange(1, DAYS + 1) / DAYS
+    bh = band(m_h, sd_h, 1.0, th)
+    inside = ((actual >= bh[5]) & (actual <= bh[95])).mean()
+    fig_rc = fan_chart(th, bh)
+    fig_rc.add_scatter(x=th, y=actual, name="Actual", line=dict(color="black"))
+    fig_rc.update_layout(xaxis_title="Years into the test year", yaxis_title="Growth of 1", height=350)
+    st.plotly_chart(fig_rc, use_container_width=True)
+    st.write(f"Fitted on data before the last year, the 5-95% band contained the actual path on **{inside:.0%}** of days. "
+             "One year is a single draw, so this shows plausibility rather than proof. The weights were chosen "
+             "using the full history, so it is not a clean out-of-sample test (see Backtest for that).")
 
 # ---- Risk tab ------------------------------------------------------------
 with tab_risk:

@@ -18,6 +18,8 @@ streamlit run app.py
 - **My portfolio:** enter an amount to invest, or what you already hold (plus optional extra cash), and get the
   recommended distribution, dollar trades and share counts (optionally whole shares).
 - **Backtest:** walk-forward rebalancing with transaction costs, versus equal-weight. Out-of-sample, no look-ahead.
+- **Forecast:** standard normal-return (geometric Brownian motion) projection of portfolio value with confidence
+  bands, plus a reality check of the method on the last year.
 - **Risk & simulation:** VaR / CVaR, drawdown, bootstrap forward simulation.
 
 All inputs are historical estimates. This is a study tool, not investment advice.
