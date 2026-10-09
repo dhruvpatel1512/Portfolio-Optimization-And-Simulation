@@ -20,6 +20,8 @@ TYPES = {"EQUITY": "Stock", "ETF": "ETF", "MUTUALFUND": "Fund", "CRYPTOCURRENCY"
 
 st.set_page_config(page_title="Portfolio Optimizer", layout="wide")
 st.title("Portfolio Optimizer")
+st.caption("Pick stocks, ETFs, bond funds or crypto, then see how to split your money, how that split would "
+           "have held up in a backtest, and what it could be worth later. Built on past prices from Yahoo Finance.")
 ss = st.session_state
 
 # ---- universe state: ss.known maps symbol -> label, ss.universe is the selection ----
@@ -169,12 +171,12 @@ with st.sidebar:
     min_years = st.slider("Drop assets with less history than (years)", 0, 15, 3)
     st.header("3. Estimation")
     lw = st.checkbox("Ledoit-Wolf shrinkage covariance", True,
-                     help="Less noisy covariance estimate than the raw sample covariance.")
+                     help="Smooths the covariance matrix so a few noisy pairs of assets don't drive the weights.")
     shrink = st.slider("Shrink expected returns toward the average", 0.0, 1.0, 0.0, 0.1,
-                       help="Optional. Tames extreme bets from noisy historical means, but in testing it lowered "
-                            "out-of-sample Sharpe on a stocks+bonds+gold universe, so it is off by default.")
+                       help="Pulls each asset's historical return toward the group average. On a test universe of stocks, "
+                            "bonds and gold it lowered out-of-sample Sharpe, so it starts at 0.")
     st.checkbox("Market-sentiment tilt (planned)", False, disabled=True,
-                help="Roadmap: sentiment-driven return views feeding the optimizer. See README.")
+                help="Not built yet. See the README roadmap.")
 
 tickers = list(ss.universe)
 if len(tickers) < 2:
@@ -188,7 +190,7 @@ prices = prices.drop(columns=missing)
 short = [t for t in prices if prices[t].dropna().shape[0] < min_years * DAYS]
 prices = prices.drop(columns=short)
 if missing or short:
-    st.warning(f"No data: {missing or '-'} | too little history: {short or '-'}")
+    st.warning(f"No data for: {missing or 'none'}. Too little history: {short or 'none'}.")
 if prices.shape[1] < 2:
     st.stop()
 
@@ -198,8 +200,8 @@ names = list(rets.columns)
 classes = [ss.known.get(t, "") for t in names]
 n = len(names)
 mu, cov = estimate(rets, lw, shrink)
-st.caption(f"{n} assets | {rets.index[0].date()} to {rets.index[-1].date()} "
-           f"({len(rets)} trading days, limited by the shortest-history asset)")
+st.caption(f"{n} assets, {rets.index[0].date()} to {rets.index[-1].date()} "
+           f"({len(rets)} trading days; the asset with the shortest history sets the start date)")
 
 tab_opt, tab_me, tab_bt, tab_fc, tab_risk = st.tabs(["Optimize", "My portfolio", "Backtest", "Forecast", "Risk & simulation"])
 key = "|".join(names)
@@ -214,7 +216,7 @@ with tab_opt:
                            "Max %": st.column_config.NumberColumn(min_value=0.0, max_value=100.0)})
 lo, hi = lim["Min %"].values / 100, lim["Max %"].values / 100
 if (lo > hi).any() or lo.sum() > 1 or hi.sum() < 1:
-    st.error("Limits are infeasible: each min must be <= max, mins must total <= 100% and maxes >= 100%.")
+    st.error("These limits can't work. Each min must be at or below its max, the mins must add up to 100% or less, and the maxes to 100% or more.")
     st.stop()
 
 # money to invest / already invested
@@ -237,7 +239,7 @@ with tab_me:
 
 w_sh, w_mv = optimise(mu, cov, rf, lo, hi, "sharpe"), optimise(mu, cov, rf, lo, hi, "vol")
 if w_sh is None or w_mv is None:
-    st.error("Optimizer failed - try loosening the limits.")
+    st.error("The optimizer couldn't find a solution. Try loosening the limits.")
     st.stop()
 portfolios = {"Max Sharpe": w_sh, "Min Volatility": w_mv, "Equal Weight": np.full(n, 1 / n)}
 if w_me is not None:
@@ -248,7 +250,7 @@ with tab_opt:
     table = pd.DataFrame({k: stats(w, mu, cov, rf) for k, w in portfolios.items()},
                          index=["Return", "Volatility", "Sharpe"]).T
     st.dataframe(table.style.format({"Return": "{:.2%}", "Volatility": "{:.2%}", "Sharpe": "{:.3f}"}))
-    st.caption("Returns shown use the estimation settings from the sidebar.")
+    st.caption("Returns use the estimation settings in the sidebar.")
 
     fr = frontier(mu, cov, rf, lo, hi)
     fig = go.Figure()
@@ -283,7 +285,7 @@ with tab_me:
     target_name = st.selectbox("Recommended allocation to follow", ["Max Sharpe", "Min Volatility", "Equal Weight"])
     tgt = portfolios[target_name]
     if total <= 0:
-        st.info("Enter an amount to invest or the amounts you already hold.")
+        st.info("Enter an amount to invest, or the amounts you already hold.")
     else:
         px = np.array([prices[t].dropna().iloc[-1] for t in names])
         trade = tgt * total - held
@@ -306,7 +308,7 @@ with tab_me:
                      f"**{target_name}:** return {b[0]:.2%}, vol {b[1]:.2%}, Sharpe {b[2]:.2f}")
         byclass = pd.DataFrame({"Current": held / total, target_name: tgt}, index=names).groupby(classes).sum()
         st.dataframe(byclass.style.format("{:.1%}"))
-        st.caption("Trades may include sells when you already hold assets. Ignores taxes, fees and minimum order sizes.")
+        st.caption("If you already hold assets, the plan may include sells. Taxes, fees and minimum order sizes are ignored.")
 
 # ---- Backtest tab --------------------------------------------------------
 with tab_bt:
@@ -316,15 +318,15 @@ with tab_bt:
     bt_obj = {"Max Sharpe": "sharpe", "Min Volatility": "vol"}[b3.selectbox("Objective", ["Max Sharpe", "Min Volatility"])]
     bt_cost = b4.number_input("Cost (bps per unit turnover)", 0, 100, 10) / 1e4
     if len(rets) <= (bt_years + 1) * DAYS:
-        st.info("Not enough history for this lookback - reduce it or pick assets with longer history.")
+        st.info("Not enough history for this lookback. Shorten it or pick assets with longer histories.")
     else:
         bt = backtest(rets, bt_years, bt_freq, bt_obj, lo, hi, rf, bt_cost, lw, shrink)
         st.plotly_chart(go.Figure([go.Scatter(x=bt.index, y=(1 + bt[k]).cumprod(), name=k) for k in bt])
                         .update_layout(yaxis_title="Growth of 1", height=450), use_container_width=True)
         st.dataframe(pd.DataFrame({k: perf(bt[k], rf) for k in bt}).T.style.format(
             {"CAGR": "{:.2%}", "Volatility": "{:.2%}", "Sharpe": "{:.3f}", "Max drawdown": "{:.2%}"}))
-        st.caption(f"Weights re-estimated each period from the prior {bt_years} years only; "
-                   f"out-of-sample from {bt.index[0].date()}. Uses the estimation settings from the sidebar.")
+        st.caption(f"Each period's weights use only the prior {bt_years} years of data. Out-of-sample from "
+                   f"{bt.index[0].date()}, with the estimation settings from the sidebar.")
 
 # ---- Forecast tab --------------------------------------------------------
 Z = {5: -1.645, 25: -0.674, 50: 0.0, 75: 0.674, 95: 1.645}
@@ -346,8 +348,8 @@ def fan_chart(x, b):
 
 
 with tab_fc:
-    st.write("Standard statistical forecast: portfolio value if returns are normally distributed with the "
-             "expected return and volatility from the sidebar settings (geometric Brownian motion).")
+    st.write("Projects portfolio value assuming normally distributed returns (geometric Brownian motion), using "
+             "the expected return and volatility from the sidebar settings.")
     f1, f2, f3 = st.columns(3)
     fc_pf = f1.selectbox("Portfolio", list(portfolios), key="fc_pf")
     fc_yrs = f2.slider("Horizon (years)", 1, 10, 3, key="fc_h")
@@ -365,8 +367,8 @@ with tab_fc:
         "Low (5%)": [bd[5][y * DAYS - 1] for y in yrs],
         "High (95%)": [bd[95][y * DAYS - 1] for y in yrs]}, index=[f"Year {y}" for y in yrs]
     ).style.format("${:,.0f}"))
-    st.caption(f"Assumes {m_:.1%} expected return and {sd_:.1%} volatility per year, constant. Real returns have "
-               "fatter tails and changing volatility, so extreme outcomes are understated. Not a prediction.")
+    st.caption(f"Assumes a constant {m_:.1%} return and {sd_:.1%} volatility per year. Real returns have fatter "
+               "tails and volatility that moves, so extreme outcomes are understated. Not a prediction.")
 
     st.subheader("Reality check: the same method on the last year")
     pr_f = rets.values @ portfolios[fc_pf]
@@ -379,9 +381,9 @@ with tab_fc:
     fig_rc.add_scatter(x=th, y=actual, name="Actual", line=dict(color="black"))
     fig_rc.update_layout(xaxis_title="Years into the test year", yaxis_title="Growth of 1", height=350)
     st.plotly_chart(fig_rc, use_container_width=True)
-    st.write(f"Fitted on data before the last year, the 5-95% band contained the actual path on **{inside:.0%}** of days. "
-             "One year is a single draw, so this shows plausibility rather than proof. The weights were chosen "
-             "using the full history, so it is not a clean out-of-sample test (see Backtest for that).")
+    st.write(f"Fitted on data from before the last year, the 5-95% band held the actual path on **{inside:.0%}** of days. "
+             "One year is a single draw, so this is a plausibility check, not proof. The weights came from the "
+             "full history, so it isn't a clean out-of-sample test. The Backtest tab is.")
 
 # ---- Risk tab ------------------------------------------------------------
 with tab_risk:
@@ -413,6 +415,6 @@ with tab_risk:
     st.plotly_chart(fan, use_container_width=True)
     st.write(f"After {horizon}y: median **\\${pct[2, -1]:,.0f}**, 5th pct \\${pct[0, -1]:,.0f}, "
              f"95th pct \\${pct[4, -1]:,.0f}. Chance of ending below the start: **{(paths[:, -1] < start_val).mean():.0%}**.")
-    st.caption("Resamples the past, so it cannot show regimes that never occurred. Not a forecast.")
+    st.caption("Resamples past returns, so it can't produce a market regime that never happened. Not a forecast.")
 
-st.caption("Inputs are historical estimates - not a forecast or investment advice.")
+st.caption("Everything here comes from past prices. It is a study tool, not investment advice.")
