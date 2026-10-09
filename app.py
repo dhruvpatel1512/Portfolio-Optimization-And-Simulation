@@ -133,4 +133,54 @@ st.plotly_chart(go.Figure(go.Heatmap(z=corr.values, x=names, y=names, zmin=-1, z
                                      colorscale="RdBu_r", text=corr.round(2).values,
                                      texttemplate="%{text}")).update_layout(height=600),
                 use_container_width=True)
-st.caption("Inputs are historical, in-sample estimates - not a forecast or investment advice.")
+# ---- walk-forward backtest -----------------------------------------------
+def backtest(rets, years, freq, objective, cap, rf, cost):
+    """Re-optimise on the trailing window at each period start; hold until the next one."""
+    lb, n = int(years * DAYS), rets.shape[1]
+    starts = [rets.index.get_loc(d) for d in rets.groupby(rets.index.to_period(freq)).head(1).index]
+    starts = [p for p in starts if p >= lb] + [len(rets)]
+    out = {"Optimised": [], "Equal Weight": []}
+    prev = {k: None for k in out}
+    for a, b in zip(starts, starts[1:]):
+        hist = rets.iloc[a - lb:a]  # strictly before the rebalance day: no look-ahead
+        w = optimise(hist.mean().values * DAYS, hist.cov().values * DAYS, rf, cap, objective)
+        targets = {"Optimised": w if w is not None else (prev["Optimised"] if prev["Optimised"] is not None else np.full(n, 1 / n)),
+                   "Equal Weight": np.full(n, 1 / n)}
+        for k, w in targets.items():
+            value = ((1 + rets.iloc[a:b]).cumprod() * w).sum(axis=1)  # buy-and-hold drift inside the period
+            r = value.pct_change()
+            r.iloc[0] = value.iloc[0] - 1
+            # ponytail: turnover measured vs previous target, ignoring intra-period drift
+            r.iloc[0] -= cost * (np.abs(w - prev[k]).sum() if prev[k] is not None else 1)
+            out[k].append(r)
+            prev[k] = w
+    return pd.DataFrame({k: pd.concat(v) for k, v in out.items()})
+
+
+def perf(r, rf):
+    wealth = (1 + r).cumprod()
+    cagr = wealth.iloc[-1] ** (DAYS / len(r)) - 1
+    vol = r.std() * np.sqrt(DAYS)
+    return {"CAGR": cagr, "Volatility": vol, "Sharpe": (cagr - rf) / vol,
+            "Max drawdown": (wealth / wealth.cummax() - 1).min()}
+
+
+st.subheader("Walk-forward backtest (out-of-sample)")
+b1, b2, b3, b4, b5 = st.columns(5)
+bt_years = b1.slider("Lookback (years)", 1, 10, 3)
+bt_freq = {"Monthly": "M", "Quarterly": "Q"}[b2.selectbox("Rebalance", ["Monthly", "Quarterly"])]
+bt_obj = {"Max Sharpe": "sharpe", "Min Volatility": "vol"}[b3.selectbox("Objective", ["Max Sharpe", "Min Volatility"])]
+bt_cost = b4.number_input("Cost (bps per unit turnover)", 0, 100, 10) / 1e4
+if len(rets) <= bt_years * DAYS + DAYS:
+    st.info("Not enough history for this lookback - reduce it or pick assets with longer history.")
+else:
+    bt = backtest(rets, bt_years, bt_freq, bt_obj, cap, rf, bt_cost)
+    fig_bt = go.Figure([go.Scatter(x=bt.index, y=(1 + bt[k]).cumprod(), name=k) for k in bt])
+    fig_bt.update_layout(yaxis_title="Growth of 1", height=450)
+    st.plotly_chart(fig_bt, use_container_width=True)
+    st.dataframe(pd.DataFrame({k: perf(bt[k], rf) for k in bt}).T.style.format(
+        {"CAGR": "{:.2%}", "Volatility": "{:.2%}", "Sharpe": "{:.3f}", "Max drawdown": "{:.2%}"}))
+    st.caption(f"Weights re-estimated each period from the prior {bt_years} years only; "
+               f"out-of-sample from {bt.index[0].date()}.")
+
+st.caption("Inputs are historical estimates - not a forecast or investment advice.")
